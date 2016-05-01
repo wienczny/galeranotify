@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 #
 # Script to send email notifications when a change in Galera cluster membership
 # occurs.
