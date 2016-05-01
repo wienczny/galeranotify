@@ -7,24 +7,18 @@
 #
 # Author: Gabe Guillen <gguillen@gesa.com>
 # Modified by: Josh Goldsmith <joshin@hotmail.com>
+# Modified by: Stephan Wienczny <stephan.wienczny@ybm-deutschland.de>
 # Version: 1.4
 # Release: 5/14/2015
 # Use at your own risk.  No warranties expressed or implied.
 #
 
-import os
 import sys
-import getopt
-
-import smtplib
-import datetime
-
-try: from email.mime.text import MIMEText
-except ImportError:
-    # Python 2.4 (CentOS 5.x)
-    from email.MIMEText import MIMEText
-
+import argparse
 import socket
+
+from datetime import datetime
+from abc import ABC, abstractmethod
 
 # Change this to some value if you don't want your server hostname to show in
 # the notification emails
@@ -32,6 +26,7 @@ THIS_SERVER = socket.gethostname()
 
 # Server hostname or IP address
 SMTP_SERVER = 'YOUR_SMTP_HERE'
+# Server port
 SMTP_PORT = 25
 
 # Set to True if you need SMTP over SSL
@@ -47,79 +42,97 @@ SMTP_PASSWORD = ''
 MAIL_FROM = 'YOUR_EMAIL_HERE'
 # Takes a list of recipients
 MAIL_TO = ['SOME_OTHER_EMAIL_HERE']
+# Subject of mail sent
+MAIL_SUBJECT = 'Galera Notification: ' + THIS_SERVER
 
-# Need Date in Header for SMTP RFC Compliance
-DATE = datetime.datetime.now().strftime( "%m/%d/%Y %H:%M" )
 
 # Edit below at your own risk
 ################################################################################
+
+
 def main(argv):
-    str_status = ''
-    str_uuid = ''
-    str_primary = ''
-    str_members = ''
-    str_index = ''
-    message = ''
+    parser = argparse.ArgumentParser(add_help=True, description='Mysql wsrep notification script')
+    parser.add_argument("-u", "--uuid", action="store", dest="uuid",
+                        help="node uuid", metavar="UUID")
+    parser.add_argument("-i", "--index", action="store", dest="index",
+                        help="node index", metavar="INDEX")
+    parser.add_argument("-s", "--status", action="store", dest="status",
+                        help="node status", metavar="STATUS")
+    parser.add_argument("-p", "--primary", action="store", dest="primary",
+                        help="node primary state <yes/no>", metavar="PRIMARY")
+    parser.add_argument("-m", "--members", action="store", dest="members",
+                        help="comma-separated list of the component member UUIDs", metavar="MEMBERS")
+    parser.add_argument("-d", "--debug", action="store_true", dest="debug", default=False,
+                        help="print state and exit")
 
-    usage = "Usage: " + os.path.basename(sys.argv[0]) + " --status <status str>"
-    usage += " --uuid <state UUID> --primary <yes/no> --members <comma-seperated"
-    usage += " list of the component member UUIDs> --index <n>"
+    args = parser.parse_args(args=argv)
 
-    try:
-        opts, args = getopt.getopt(argv, "h", ["status=","uuid=",'primary=','members=','index='])
-    except getopt.GetoptError:
-        print(usage)
-        sys.exit(2)
+    message_obj = GaleraStatus(THIS_SERVER)
+    message_obj.set_uuid(args.uuid)
+    message_obj.set_index(args.index)
+    message_obj.set_status(args.status)
+    message_obj.set_primary(args.primary)
+    message_obj.set_members(args.members)
 
-    if(len(opts) > 0):
-        message_obj = GaleraStatus(THIS_SERVER)
+    if args.debug:
+        print(str(message_obj))
 
-        for opt, arg in opts:
-            if opt == '-h':
-                print(usage)
-                sys.exit()
-            elif opt in ("--status"):
-                message_obj.set_status(arg)
-            elif opt in ("--uuid"):
-                message_obj.set_uuid(arg)
-            elif opt in ("--primary"):
-                message_obj.set_primary(arg)
-            elif opt in ("--members"):
-                message_obj.set_members(arg)
-            elif opt in ("--index"):
-                message_obj.set_index(arg)
+    actions = []
+    if SMTP_SERVER:
+        actions.append(SMTPAction(SMTP_SERVER, SMTP_PORT, SMTP_SSL, SMTP_AUTH, SMTP_USERNAME,
+                                  SMTP_PASSWORD, MAIL_FROM, MAIL_TO, MAIL_SUBJECT))
+
+    return_code = 0
+
+    for action in actions:
         try:
-            send_notification(MAIL_FROM, MAIL_TO, 'Galera Notification: ' + THIS_SERVER, DATE,
-                              str(message_obj), SMTP_SERVER, SMTP_PORT, SMTP_SSL, SMTP_AUTH,
-                              SMTP_USERNAME, SMTP_PASSWORD)
+            action.notify(message_obj)
         except Exception as e:
             print("Unable to send notification: %s" % e)
-            sys.exit(1)
-    else:
-        print(usage)
-        sys.exit(2)
+            return_code = 1
 
-    sys.exit(0)
+    sys.exit(return_code)
 
-def send_notification(from_email, to_email, subject, date, message, smtp_server,
-                      smtp_port, use_ssl, use_auth, smtp_user, smtp_pass):
-    msg = MIMEText(message)
 
-    msg['From'] = from_email
-    msg['To'] = ', '.join(to_email)
-    msg['Subject'] =  subject
-    msg['Date'] =  date
+class NotificationAction(ABC):
+    @abstractmethod
+    def notify(self, message):
+        pass
 
-    if(use_ssl):
-        mailer = smtplib.SMTP_SSL(smtp_server, smtp_port)
-    else:
-        mailer = smtplib.SMTP(smtp_server, smtp_port)
 
-    if(use_auth):
-        mailer.login(smtp_user, smtp_pass)
+class SMTPAction(NotificationAction):
+    def __init__(self, smtp_server, smtp_port, use_ssl, use_auth, smtp_user, smtp_pass, smtp_from,
+                 smtp_to, smtp_subject):
+        self._server = smtp_server
+        self._port = smtp_port
+        self._use_ssl = use_ssl
+        self._use_auth = use_auth
+        self._user = smtp_user
+        self._pass = smtp_pass
+        self._from = smtp_from
+        self._to = smtp_to
+        self._subject = smtp_subject
 
-    mailer.sendmail(from_email, to_email, msg.as_string())
-    mailer.close()
+    def notify(self, message):
+        from smtplib import SMTP, SMTP_SSL
+        from email.mime.text import MIMEText
+
+        if message.get_count() <= 0:
+            return
+
+        msg = MIMEText(str(message))
+
+        msg['From'] = self._from
+        msg['To'] = ', '.join(self._to)
+        msg['Subject'] = self._subject
+        msg['Date'] = datetime.now().strftime("%m/%d/%Y %H:%M")
+
+        with SMTP_SSL() if self._use_ssl else SMTP() as mailer:
+            mailer.connect(self._server, self._port)
+            if self._use_auth:
+                mailer.login(self._user, self._pass)
+            mailer.send_message(msg)
+
 
 class GaleraStatus:
     def __init__(self, server):
@@ -135,46 +148,62 @@ class GaleraStatus:
         self._status = status
         self._count += 1
 
+    def get_status(self):
+        return self._status
+
     def set_uuid(self, uuid):
         self._uuid = uuid
         self._count += 1
 
+    def get_uuid(self):
+        return self._uuid
+
     def set_primary(self, primary):
-        self._primary = primary.capitalize()
-        self._count += 1
+        if primary is not None:
+            self._primary = primary.capitalize()
+            self._count += 1
+
+    def get_primary(self):
+        return self._primary
 
     def set_members(self, members):
-        self._members = members.split(',')
-        self._count += 1
+        if members is not None:
+            self._members = members.split(',')
+            self._count += 1
+
+    def get_members(self):
+        return self._members
 
     def set_index(self, index):
-        self._index = index
-        self._count += 1
+        if index is not None:
+            self._index = index
+            self._count += 1
+
+    def get_index(self):
+        return self._index
+
+    def get_count(self):
+        return self._count
 
     def __str__(self):
-        message = "Galera running on " + self._server + " has reported the following"
-        message += " cluster membership change"
+        message = "Galera running on {} has reported the following cluster membership change{}:" \
+                  "\n\n".format(self._server, "s" if self._count > 0 else "")
 
-        if(self._count > 1):
-            message += "s"
+        if self._status:
+            message += "Status of this node: {}\n\n" .format(self._status)
 
-        message += ":\n\n"
+        if self._uuid:
+            message += "Cluster state UUID: {}\n\n".format(self._uuid)
 
-        if(self._status):
-            message += "Status of this node: " + self._status + "\n\n"
+        if self._primary:
+            message += "Current cluster component is primary: {}\n\n".format(self._primary)
 
-        if(self._uuid):
-            message += "Cluster state UUID: " + self._uuid + "\n\n"
-
-        if(self._primary):
-            message += "Current cluster component is primary: " + self._primary + "\n\n"
-
-        if(self._members):
+        if self._members:
             message += "Current members of the component:\n"
 
-            if(self._index):
+            if self._index:
                 for i in range(len(self._members)):
-                    if(i == int(self._index)):
+                    if i == int(self._index):
                         message += "-> "
                     else:
                         message += "-- "
@@ -185,10 +214,11 @@ class GaleraStatus:
 
             message += "\n"
 
-        if(self._index):
-            message += "Index of this node in the member list: " + self._index + "\n"
+        if self._index:
+            message += "Index of this node in the member list: {}\n".format(self._index)
 
         return message
+
 
 if __name__ == "__main__":
     main(sys.argv[1:])
